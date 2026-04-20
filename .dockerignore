@@ -6,6 +6,6 @@ __pycache__
 .pytest_cache
 .env
 .env.*
-tests/
+# tests/ (We need this inside the builder stage to run tests!)
 *.md
 docker-compose.yml
