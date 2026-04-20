@@ -1,0 +1,154 @@
+name: CI Pipeline
+
+# ── Trigger ──────────────────────────────────────────────────────────────────
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+
+# ── Jobs ─────────────────────────────────────────────────────────────────────
+jobs:
+
+  # ── Job 1: Unit tests (no database required) ────────────────────────────────
+  # Fast feedback — runs on every push and every pull request.
+  # SKIP_DB=true tells the app factory to skip DB connection at startup.
+  unit-test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run unit tests (no DB)
+        env:
+          SKIP_DB: "true"
+        run: pytest tests/ -v -k "not Integration"
+
+
+  # ── Job 2: Integration tests (real PostgreSQL service container) ────────────
+  # Spins up a real Postgres container alongside the test runner.
+  # Integration tests are automatically selected when DATABASE_URL is set.
+  integration-test:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: unit-test
+
+    # GitHub Actions service containers: a sidecar container that runs
+    # next to your job's runner. The runner can reach it at localhost:5432.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER:     devops
+          POSTGRES_PASSWORD: devops_secret
+          POSTGRES_DB:       builds_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U devops -d builds_db"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run integration tests (with real DB)
+        env:
+          DATABASE_URL: postgresql://devops:devops_secret@localhost:5432/builds_db
+          COMMIT_SHA:   ${{ github.sha }}
+          BUILD_TIME:   "ci-test"
+          RUN_NUMBER:   ${{ github.run_number }}
+        run: pytest tests/ -v
+
+
+  # ── Job 3: Build and push Docker image ─────────────────────────────────────
+  # Only runs after BOTH test jobs pass.
+  # Only pushes images on pushes to main or develop (not on pull requests).
+  build-and-push:
+    name: Build & Push
+    runs-on: ubuntu-latest
+    needs: [unit-test, integration-test]
+
+    if: github.event_name == 'push'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Capture build timestamp
+        id: timestamp
+        run: echo "value=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Build the multi-stage image.
+      # Stage 1 (builder) runs tests INSIDE the image build.
+      # If tests fail inside Docker, the image is not produced.
+      # Stage 2 (runtime) is the clean image that gets pushed.
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          # :latest for convenience  |  :<sha> for rollback traceability
+          tags: |
+            ghcr.io/${{ github.repository }}:latest
+            ghcr.io/${{ github.repository }}:${{ github.sha }}
+          # These three become ENV variables baked into the runtime image.
+          # The /version endpoint returns them.
+          build-args: |
+            COMMIT_SHA=${{ github.sha }}
+            BUILD_TIME=${{ steps.timestamp.outputs.value }}
+            RUN_NUMBER=${{ github.run_number }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.created=${{ steps.timestamp.outputs.value }}
+          # GitHub Actions layer cache — cuts build time on subsequent runs
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -1,0 +1,98 @@
+version: "3.9"
+
+# ── DevOps Version API — local development stack ─────────────────────────────
+#
+# Usage:
+#   docker compose up --build          # start everything (foreground)
+#   docker compose up -d --build       # start in the background
+#   docker compose logs -f api         # follow logs for the API
+#   docker compose down                # stop containers (data is kept)
+#   docker compose down -v             # stop and DELETE all data (volumes)
+#
+# Endpoints once running:
+#   http://localhost:5000/version      ← pipeline metadata
+#   http://localhost:5000/health       ← liveness + DB check
+#   http://localhost:5000/builds       ← deployment history (grows on restart)
+#
+# Note: for local runs, build-args use placeholder values.
+#       In the real GitHub Actions pipeline, live SHA / timestamp / run number
+#       are injected so /version shows real data.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── PostgreSQL database ────────────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine          # alpine = smallest possible Postgres image
+
+    environment:
+      POSTGRES_USER:     devops
+      POSTGRES_PASSWORD: devops_secret
+      POSTGRES_DB:       builds_db
+
+    volumes:
+      # Named volume: data persists even after "docker compose down".
+      # Delete it with "docker compose down -v" to start fresh.
+      - postgres_data:/var/lib/postgresql/data
+
+    # Health check: Compose will wait until this passes before starting the API.
+    # Without this, the API container starts immediately and crashes because
+    # Postgres isn't ready yet.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U devops -d builds_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+    # Only expose the DB port locally for debugging (psql, DBeaver, etc.)
+    # In production, this port would NOT be exposed — the DB is internal only.
+    ports:
+      - "5432:5432"
+
+  # ── Flask API ──────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      target: runtime                  # build only up to the runtime stage
+
+      # Placeholder values for local development.
+      # In GitHub Actions, the pipeline injects real values.
+      args:
+        COMMIT_SHA: "local-dev"
+        BUILD_TIME: "local"
+        RUN_NUMBER: "0"
+
+    ports:
+      - "5000:5000"
+
+    environment:
+      # The DB hostname is "db" — the service name above.
+      # Docker Compose creates a private network where every service
+      # is reachable by its service name as a DNS hostname.
+      DATABASE_URL: postgresql://devops:devops_secret@db:5432/builds_db
+
+      FLASK_ENV:   development
+      FLASK_DEBUG: "1"
+
+    # Do not start the API until the DB passes its health check.
+    # "service_healthy" requires the healthcheck block on the db service.
+    depends_on:
+      db:
+        condition: service_healthy
+
+    restart: unless-stopped
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 20s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+# ── named volumes ──────────────────────────────────────────────────────────
+volumes:
+  postgres_data:
+    # Docker manages this volume.
+    # It lives at /var/lib/docker/volumes/devops-version-api-v2_postgres_data/
+    # and survives container restarts.
