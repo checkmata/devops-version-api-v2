@@ -42,6 +42,7 @@ jobs:
       - name: Run unit tests (no DB)
         env:
           SKIP_DB: "true"
+          PYTHONPATH: "."
         run: pytest tests/ -v -k "not Integration"
 
 
@@ -95,6 +96,7 @@ jobs:
           COMMIT_SHA:   ${{ github.sha }}
           BUILD_TIME:   "ci-test"
           RUN_NUMBER:   ${{ github.run_number }}
+          PYTHONPATH: "."
         run: pytest tests/ -v
 
 
